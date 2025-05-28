@@ -1,0 +1,9 @@
+'''txt
+torch>=1.12
+transformers>=4.30
+peft>=0.5
+scikit-learn
+pandas
+matplotlib
+tqdm
+lime

@@ -1,0 +1,40 @@
+This project implements an aspect-level sentiment analysis (ABSA) system based on T5 + LoRA. The main functions are as follows:
+
+Data loading and preprocessing:
+Read multiple SemEval-2014 and SemEval-2015 dataset CSV files, extract the position of aspect words in the sentence and construct BIO tags and sentiment polarity tags.
+
+Word segmentation and dataset construction:
+Use T5Tokenizer for text encoding, and build a PyTorch Dataset that supports BIO tags and sentiment classification.
+
+Model architecture:
+
+Use the frozen T5 Encoder as the feature extractor;
+
+Inject LoRA (low-rank adaptation) parameters on its basis;
+
+Connect a two-head MLP at the output:
+→ one for BIO sequence labeling
+→ one for sentiment classification.
+
+Loss function:
+Two cross entropy losses (CrossEntropyLoss) are used for supervised training of BIO tags and sentiment tags respectively.
+
+Training process:
+Use the Adam optimizer to jointly train the two tasks, and record the changes in loss, F1, and accuracy for each round.
+
+Evaluation module:
+
+Output Macro-F1 and Accuracy;
+
+Draw classification report and confusion matrix;
+
+Show training curve (Loss, BIO F1, Sentiment ACC).
+(ps: The 2014 dataset will output the above visualization, and the 2015 dataset will not output the confusion matrix, but output the model performance bar chart instead.)
+
+Explainability Analysis (XAI):
+
+Use LIME to show the sensitivity of the model to key tokens;
+
+Use gradient saliency map to show the model's attention intensity to each input word;
+
+Visualize Encoder Attention Matrix Heat Map.

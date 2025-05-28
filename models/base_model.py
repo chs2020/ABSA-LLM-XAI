@@ -1,122 +1,116 @@
-from transformers import AutoModel, AutoTokenizer, T5ForConditionalGeneration
-from peft import get_peft_model
 import torch
+from transformers import (
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoModelForSeq2SeqLM,
+    AutoTokenizer,
+    AutoConfig,
+)
+from peft import get_peft_model
 
 
 class LLMWrapper:
     def __init__(self, model_name, use_peft=False, peft_config=None, device="cuda"):
         """
-        通用大语言模型封装器（LLM Wrapper）
-
-        主要功能：
-        - 封装 tokenizer + 模型
-        - 自动判断模型是 encoder-only（如BERT）还是 encoder-decoder（如T5）
-        - 支持 PEFT 微调结构（如 LoRA、Adapter）
-
-        参数说明：
-        - model_name: 模型名称字符串，如 'bert-base-uncased' 或 't5-base'
-        - use_peft: 是否使用 PEFT 微调（True 时应用 peft_config）
-        - peft_config: PEFT 配置对象（LoRAConfig / AdapterConfig）
-        - device: 使用设备（默认使用 GPU，有则用 GPU，没有用 CPU）
+        通用语言模型封装器：支持 encoder-decoder 和 decoder-only 架构
+        - model_name: HuggingFace 模型名
+        - use_peft: 是否使用 PEFT（如 LoRA）
+        - peft_config: PEFT 配置对象
+        - device: 使用的设备（如 'cuda' 或 'cpu'）
         """
-
-        # 自动选择可用设备
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
-        # 加载对应模型的分词器
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        # 初始化 tokenizer（use_fast=True 通常更快）
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
 
-        # 判断模型结构：是否为 encoder-decoder（如 T5）
-        if "t5" in model_name.lower():
-            self.is_encoder_decoder = True
-            self.model = T5ForConditionalGeneration.from_pretrained(model_name)
+        # 获取模型配置，判断模型类型
+        config = AutoConfig.from_pretrained(model_name)
+        model_type = config.model_type.lower()
+
+        # 判断是否为 encoder-decoder 模型（如 T5、BART）
+        self.is_encoder_decoder = model_type in [
+            "t5", "mt5", "bart", "mbart", "pegasus", "blenderbot"
+        ]
+
+        # 根据类型自动加载合适模型
+        if self.is_encoder_decoder:
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(self.device)
+        elif model_type in ["gemma", "llama", "gpt2", "bloom", "opt"]:
+            self.model = AutoModelForCausalLM.from_pretrained(model_name).to(self.device)
         else:
-            self.is_encoder_decoder = False
-            self.model = AutoModel.from_pretrained(model_name)
+            self.model = AutoModel.from_pretrained(model_name).to(self.device)
 
-        # 如果启用了 PEFT（如 LoRA / Adapter），将其结构注入模型中
+        # 如果启用 PEFT 微调
         if use_peft and peft_config is not None:
             self.model = get_peft_model(self.model, peft_config)
+            self.model.print_trainable_parameters()
 
-        # 将模型移动到指定设备（CPU 或 GPU）
-        self.model.to(self.device)
-        self.model.eval()  # 默认设置为评估模式
-
-    def encode_prompt(self, prompt: str, max_length=512):
+    def encode_text(self, sentences, max_length=512):
         """
-        对文本 prompt 进行编码，用于模型输入。
-
-        返回：
-        - 一个 dict，包括 input_ids 和 attention_mask，并自动转移到 self.device
+        对输入句子编码为 token ids，输出 tensor 字典
         """
-        encoded = self.tokenizer(
-            prompt,
-            return_tensors="pt",       # 返回 PyTorch tensor 格式
-            max_length=max_length,     # 最大长度限制
-            truncation=True,           # 超长截断
-            padding=True               # 自动padding至最大长度
+        if isinstance(sentences, str):
+            sentences = [sentences]
+
+        batch = self.tokenizer(
+            sentences,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_length
         )
-        return {k: v.to(self.device) for k, v in encoded.items()}
+        return {k: v.to(self.device) for k, v in batch.items()}
 
-    def generate(self, prompt: str, max_new_tokens=50):
+    def build_prompt(self, sentences, prompt_prefix=""):
         """
-        文本生成接口，仅用于 encoder-decoder 架构（如 T5）
-
-        参数：
-        - prompt: 输入的提示词
-        - max_new_tokens: 控制最大生成长度
-
-        返回：
-        - 生成的文本结果（字符串）
+        构造 prompt，可拼接固定提示词（硬 prompt）
         """
-        if not self.is_encoder_decoder:
-            raise NotImplementedError("generate 仅适用于 encoder-decoder 模型（如 T5）")
+        if isinstance(sentences, str):
+            sentences = [sentences]
+        return [f"{prompt_prefix} {s}" for s in sentences]
 
-        # 编码输入
-        inputs = self.encode_prompt(prompt)
+    def encode_prompt(self, sentences, prompt_prefix="", max_length=512):
+        """
+        组合 prompt 和原句，进行编码
+        """
+        prompts = self.build_prompt(sentences, prompt_prefix)
+        return self.encode_text(prompts, max_length=max_length)
 
-        # 禁用梯度，进入推理模式
+    def encode_hidden_batch(self, input_ids, attention_mask):
+        """
+        提取 hidden states，支持 encoder-only 和 encoder-decoder 架构
+        用于 token-level 特征抽取（如 BIO 标签任务）
+        """
         with torch.no_grad():
-            output_ids = self.model.generate(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                max_new_tokens=max_new_tokens
-            )
-
-        # 解码输出 token 序列为字符串
-        return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
-
-    def encode_hidden(self, prompt: str):
-        """
-        用于分类 / BIO 序列标注任务，返回 encoder 输出。
-
-        参数：
-        - prompt: 输入文本（一个句子）
-
-        返回：
-        - last_hidden_state: 最后一层隐藏状态（用于分类/BIO）
-        - attention_mask: 用于对 padding 部分屏蔽
-        """
-        # 编码输入文本
-        inputs = self.encode_prompt(prompt)
-
-        # 不计算梯度（推理模式）
-        with torch.no_grad():
-            if self.is_encoder_decoder:
-                # T5等模型：直接访问 encoder 模块
+            if self.is_encoder_decoder and hasattr(self.model, "encoder"):
+                # 对于 T5/BART 等，调用 encoder
                 outputs = self.model.encoder(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    return_dict=True
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_dict=True,
                 )
             else:
-                # BERT等模型：默认 forward 输出 hidden_state
+                # 对于 GPT/LLaMA/Gemma 等，直接用主模型
                 outputs = self.model(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    return_dict=True
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_dict=True,
                 )
+        return outputs.last_hidden_state, attention_mask
 
-        # 返回隐藏层表示 + 注意力 mask
-        return outputs.last_hidden_state, inputs["attention_mask"]
+    def generate(self, sentences, prompt_prefix="", max_new_tokens=50):
+        """
+        对模型进行生成推理（如问答/翻译），要求模型支持 generate()
+        """
+        if not hasattr(self.model, "generate"):
+            raise NotImplementedError("当前模型不支持 generate()")
 
+        batch = self.encode_prompt(sentences, prompt_prefix)
+
+        with torch.no_grad():
+            out_ids = self.model.generate(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                max_new_tokens=max_new_tokens,
+            )
+        return self.tokenizer.decode(out_ids[0], skip_special_tokens=True)
